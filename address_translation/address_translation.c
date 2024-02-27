@@ -10,6 +10,7 @@
 #include <linux/module.h>
 #include <linux/types.h>
 #include <linux/version.h>
+#include <linux/rmap.h>
 
 #define NR_DEV 1
 
@@ -30,12 +31,12 @@ static void print_address(void *addr, char *name) {
   pr_info("Virtual Address: 0x%llx\n", (unsigned long long)addr);
 }
 
-int at_open(struct inode *inode, struct file *filp) {
+static int at_open(struct inode *inode, struct file *filp) {
   pr_info("Device Open\n");
   return 0; /* success */
 }
 
-int at_release(struct inode *inode, struct file *filp) {
+static int at_release(struct inode *inode, struct file *filp) {
   pr_info("Device Close\n");
   return 0;
 }
@@ -57,8 +58,6 @@ static struct folio *get_folio(unsigned long pfn) {
   struct page *page = pfn_to_page(pfn);
   struct folio *folio;
   pr_info("page: %p\n", page);
-	usnigned long phys_mem = page_to_phys(page);
-
   if (!page || PageTail(page))
     return NULL;
   pr_info("Got Page\n");
@@ -73,16 +72,32 @@ static struct folio *get_folio(unsigned long pfn) {
   return folio;
 }
 
-void analyse_physical_address(const unsigned long addr) {
+static bool folio_data(struct folio *folio, struct vm_area_struct *vma,
+                       unsigned long address, void *arg) {
+  DEFINE_FOLIO_VMA_WALK(pvmw, folio, vma, address, 0);
+  pr_info("Inside Folio Data\n");
+	struct task_struct *task = vma->vm_mm->owner;
+	pr_info("Task %s\n", task->comm);
+	return true;
+}
+
+static void analyse_physical_address(const unsigned long addr) {
+				int data = 0;
   struct folio *folio = get_folio(PHYS_PFN(addr));
+  struct rmap_walk_control rwc = {
+      .rmap_one = folio_data,
+			.arg = (void *)&data,
+  };
+
   if (folio == NULL) {
     pr_err("Invalid Physical address: %lu\n", addr);
     return;
   }
   pr_info("Folio Address: %p\n", folio);
+  rmap_walk(folio, &rwc);
 }
 
-ssize_t at_write(struct file *filp, const char __user *buf, size_t count,
+static ssize_t at_write(struct file *filp, const char __user *buf, size_t count,
                  loff_t *f_pos) {
   char *data = (char *)kmalloc(4096, GFP_KERNEL);
   unsigned long addr;
@@ -105,14 +120,14 @@ ssize_t at_write(struct file *filp, const char __user *buf, size_t count,
   return count;
 }
 
-struct file_operations at_fops = {
+static struct file_operations at_fops = {
     .owner = THIS_MODULE,
     .write = at_write,
     .open = at_open,
     .release = at_release,
 };
 
-static void __exit address_translation_exit(void) {
+void __exit address_translation_exit(void) {
   cdev_del(&c_dev);
   device_destroy(cl, first);
   class_destroy(cl);
@@ -120,7 +135,7 @@ static void __exit address_translation_exit(void) {
   pr_info("Address Translation Module Unloaded\n");
 }
 
-static int __init address_translation_init(void) {
+int __init address_translation_init(void) {
   pr_info("Address Translation Module Loaded\n");
 
   if (alloc_chrdev_region(&first, 0, NR_DEV, "at_dev") < 0) {

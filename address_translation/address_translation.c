@@ -12,6 +12,8 @@
 #include <linux/version.h>
 #include <linux/rmap.h>
 
+void __exit address_translation_exit(void);
+int __init address_translation_init(void);
 #define NR_DEV 1
 
 struct at_dev {
@@ -21,10 +23,10 @@ struct at_dev {
 static dev_t first;       // Global variable for the first device number
 static struct cdev c_dev; // Global variable for the character device structure
 static struct class *cl;  // Global variable for the device class
-/* static struct at_dev *at_devices; */
 
 static void print_address(void *addr, char *name) {
   phys_addr_t phys_addr;
+	// TODO
   phys_addr = virt_to_phys(addr);
   pr_info("************* Symbol %s *************\n", name);
   pr_info("Physical Address: 0x%llx\n", (unsigned long long)phys_addr);
@@ -42,6 +44,7 @@ static int at_release(struct inode *inode, struct file *filp) {
 }
 
 /*
+ * Code copied from Linux Kernel Source
  * Idle page tracking only considers user memory pages, for other types of
  * pages the idle flag is always unset and an attempt to set it is silently
  * ignored.
@@ -74,7 +77,6 @@ static struct folio *get_folio(unsigned long pfn) {
 
 static bool folio_data(struct folio *folio, struct vm_area_struct *vma,
                        unsigned long address, void *arg) {
-  DEFINE_FOLIO_VMA_WALK(pvmw, folio, vma, address, 0);
   pr_info("Inside Folio Data\n");
 	struct task_struct *task = vma->vm_mm->owner;
 	pr_info("Task %s\n", task->comm);
@@ -105,6 +107,7 @@ static ssize_t at_write(struct file *filp, const char __user *buf, size_t count,
   memset(data, 0, 4096);
   if (copy_from_user(data, buf, count))
     return -EFAULT;
+	/* 1st byte tells us about the type of memory */
   if (kstrtoul(data + 1, 16, &addr)) {
     pr_warn("invalid address '%s'\n", data);
     return -EFAULT;
@@ -157,9 +160,6 @@ int __init address_translation_init(void) {
     unregister_chrdev_region(first, 1);
     return -1;
   }
-
-  print_address((void *)&address_translation_init, "init");
-  print_address((void *)&address_translation_exit, "exit");
   return 0;
 }
 

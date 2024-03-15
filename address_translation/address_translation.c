@@ -1,3 +1,7 @@
+#include "linux/mm_types.h"
+#include "linux/printk.h"
+#include "linux/sched.h"
+#include "linux/vmalloc.h"
 #include <asm-generic/errno-base.h>
 #include <asm/io.h>
 #include <linux/cdev.h>
@@ -8,9 +12,9 @@
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/rmap.h>
 #include <linux/types.h>
 #include <linux/version.h>
-#include <linux/rmap.h>
 
 void __exit address_translation_exit(void);
 int __init address_translation_init(void);
@@ -20,29 +24,19 @@ struct at_dev {
   struct cdev c_dev;
 };
 
+struct task_data {
+  struct task_struct *task;
+  struct vm_area_struct *vma;
+} task_data;
+
+struct rwc_args {
+  unsigned long long addr_to_be_resolved;
+};
+
+static int *test;
 static dev_t first;       // Global variable for the first device number
 static struct cdev c_dev; // Global variable for the character device structure
 static struct class *cl;  // Global variable for the device class
-
-static void print_address(void *addr, char *name) {
-  phys_addr_t phys_addr;
-	// TODO
-  phys_addr = virt_to_phys(addr);
-  pr_info("************* Symbol %s *************\n", name);
-  pr_info("Physical Address: 0x%llx\n", (unsigned long long)phys_addr);
-  pr_info("Virtual Address: 0x%llx\n", (unsigned long long)addr);
-}
-
-static int at_open(struct inode *inode, struct file *filp) {
-  pr_info("Device Open\n");
-  return 0; /* success */
-}
-
-static int at_release(struct inode *inode, struct file *filp) {
-  pr_info("Device Close\n");
-  return 0;
-}
-
 /*
  * Code copied from Linux Kernel Source
  * Idle page tracking only considers user memory pages, for other types of
@@ -60,14 +54,11 @@ static int at_release(struct inode *inode, struct file *filp) {
 static struct folio *get_folio(unsigned long pfn) {
   struct page *page = pfn_to_page(pfn);
   struct folio *folio;
-  pr_info("page: %p\n", page);
   if (!page || PageTail(page))
     return NULL;
-  pr_info("Got Page\n");
   folio = page_folio(page);
   if (!folio_test_lru(folio) || !folio_try_get(folio))
     return NULL;
-  pr_info("Got Folio\n");
   if (unlikely(page_folio(page) != folio || !folio_test_lru(folio))) {
     folio_put(folio);
     folio = NULL;
@@ -75,51 +66,128 @@ static struct folio *get_folio(unsigned long pfn) {
   return folio;
 }
 
-static bool folio_data(struct folio *folio, struct vm_area_struct *vma,
-                       unsigned long address, void *arg) {
-  pr_info("Inside Folio Data\n");
-	struct task_struct *task = vma->vm_mm->owner;
-	pr_info("Task %s\n", task->comm);
-	return true;
+static unsigned long long get_physical_address(unsigned long virt_addr,
+                                               struct task_struct *task) {
+  struct mm_struct *task_mm;
+  pgd_t *pgd;
+  p4d_t *p4d;
+  pud_t *pud;
+  pmd_t *pmd;
+  pte_t *pte;
+  struct page *page = NULL;
+  unsigned long offset_within_page;
+  unsigned long long phys_addr = 0;
+
+  task_mm = task->mm;
+  // acquire page table lock
+  spin_lock(&(task_mm->page_table_lock));
+
+  pgd = pgd_offset(task_mm, virt_addr);
+  if (pgd_none(*pgd))
+    printk(KERN_EMERG "No pgd");
+  printk(KERN_EMERG "pgd pointer: %p pgd entry:%p\n", task_mm->pgd, pgd);
+
+  p4d = p4d_offset(pgd, virt_addr);
+  if (p4d_none(*p4d))
+    printk(KERN_EMERG "No p4d");
+
+  pud = pud_offset(p4d, virt_addr);
+  if (pud_none(*pud))
+    printk(KERN_EMERG "No pud");
+
+  pmd = pmd_offset(pud, virt_addr);
+  if (pmd_none(*pmd))
+    printk(KERN_EMERG "No pmd");
+
+  pte = pte_offset_kernel(pmd, virt_addr);
+  if (pte_present(*pte)) {
+    page = pte_page(*pte);
+    offset_within_page = (virt_addr) & (PAGE_SIZE - 1);
+    phys_addr = page_to_phys(page) + offset_within_page;
+  } else
+    printk(KERN_EMERG "No pte present");
+  pte_unmap(pte);
+  // Release spin lock
+  spin_unlock(&(task_mm->page_table_lock));
+  return phys_addr;
 }
 
-static void analyse_physical_address(const unsigned long addr) {
-				int data = 0;
+static void print_address(void *addr, char *name) {
+  phys_addr_t phys_addr;
+  // TODO
+  phys_addr = virt_to_phys(addr);
+  pr_info("************* Symbol %s *************\n", name);
+  pr_info("Physical Address: 0x%llx\n", (unsigned long long)phys_addr);
+  pr_info("Virtual Address: 0x%llx\n", (unsigned long long)addr);
+}
+
+static int at_open(struct inode *inode, struct file *filp) {
+  pr_info("Device Open\n");
+  return 0; /* success */
+}
+
+static int at_release(struct inode *inode, struct file *filp) {
+  pr_info("Device Close\n");
+  return 0;
+}
+
+static bool folio_data(struct folio *folio, struct vm_area_struct *vma,
+                       unsigned long address, void *arg) {
+  struct task_struct *task = vma->vm_mm->owner;
+  struct rwc_args data = *(struct rwc_args *)arg;
+  unsigned long page_start = address;
+  unsigned long long phys_addr_page_start;
+  unsigned int offset_within_page;
+  phys_addr_page_start = get_physical_address(page_start, task);
+  offset_within_page = data.addr_to_be_resolved - phys_addr_page_start;
+
+  pr_info("Virtual Address of 0x%llx is 0x%lx", data.addr_to_be_resolved,
+          address + offset_within_page);
+  pr_info("Task %s\n", task->comm);
+  return true;
+}
+
+static void analyse_physical_address(const unsigned long long addr) {
+  struct rwc_args data;
   struct folio *folio = get_folio(PHYS_PFN(addr));
+  struct vmap_area *va;
+  data.addr_to_be_resolved = addr;
   struct rmap_walk_control rwc = {
       .rmap_one = folio_data,
-			.arg = (void *)&data,
+      .arg = (void *)&data,
   };
 
-  if (folio == NULL) {
-    pr_err("Invalid Physical address: %lu\n", addr);
+  if (folio != NULL) {
+    rmap_walk(folio, &rwc);
     return;
   }
-  pr_info("Folio Address: %p\n", folio);
-  rmap_walk(folio, &rwc);
+  pr_err("Physical address 0x%llx is not mapped to any user process\n", addr);
+  /*
+   * This means that the memory doesn't belongs to User Space
+   * Let's check for kernel space before actually throwing an error
+   */
+  va = find_vmap_area(addr);
+  if (va == NULL) {
+    pr_err("Invalid physical address: 0x%llx\n", addr);
+		return;
+  }
+	pr_info("VA start: 0x%lx\n", va->va_start);
+  return;
 }
 
 static ssize_t at_write(struct file *filp, const char __user *buf, size_t count,
-                 loff_t *f_pos) {
+                        loff_t *f_pos) {
   char *data = (char *)kmalloc(4096, GFP_KERNEL);
-  unsigned long addr;
-  char c;
+  unsigned long long addr;
   memset(data, 0, 4096);
   if (copy_from_user(data, buf, count))
     return -EFAULT;
-	/* 1st byte tells us about the type of memory */
-  if (kstrtoul(data + 1, 16, &addr)) {
+  if (kstrtoull(data, 16, &addr)) {
     pr_warn("invalid address '%s'\n", data);
     return -EFAULT;
   }
-  pr_info("Device Wrote %lu bytes: 0x%lX", count, addr);
-  c = data[0];
-  if (c == 'v') {
-    print_address((void *)addr, "virtual to physical");
-  } else {
-    analyse_physical_address(addr);
-  }
-
+  pr_info("Device Wrote %lu bytes: 0x%llX", count, addr);
+  analyse_physical_address(addr);
   return count;
 }
 
@@ -140,7 +208,12 @@ void __exit address_translation_exit(void) {
 
 int __init address_translation_init(void) {
   pr_info("Address Translation Module Loaded\n");
-
+  test = (int *)vmalloc(16507);
+  if (test == NULL) {
+    pr_err("Unable to allocate Memory\n");
+  } else {
+    pr_info("Memory address: 0x%p", test);
+  }
   if (alloc_chrdev_region(&first, 0, NR_DEV, "at_dev") < 0) {
     return -1;
   }
@@ -160,6 +233,8 @@ int __init address_translation_init(void) {
     unregister_chrdev_region(first, 1);
     return -1;
   }
+  print_address((void *)&address_translation_init, "init");
+  print_address((void *)&address_translation_exit, "exit");
   return 0;
 }
 
